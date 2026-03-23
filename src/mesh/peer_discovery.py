@@ -1,68 +1,94 @@
-import hashlib
-import random
-import json
-from typing import List, Dict
+import asyncio
+from zeroconf import ServiceInfo, Zeroconf, ServiceBrowser
+from typing import Dict, Set, Optional
+import time
+import logging
 
 class PeerDiscovery:
-    def __init__(self, seed_peers: List[str], trust_model: str = 'web-of-trust'):
-        self.seed_peers = seed_peers
-        self.trust_model = trust_model
-        self.peer_trust: Dict[str, float] = {}
-        self.peer_connections: Dict[str, List[str]] = {}
-        self.initialize_trust()
+    SERVICE_TYPE = '_swarmnet._tcp.local.'
+    
+    def __init__(self, node_id: str, port: int):
+        self.node_id = node_id
+        self.port = port
+        self.peers: Dict[str, tuple] = {}
+        self.zeroconf = Zeroconf()
+        self.browser = None
+        self.info = None
+        self.logger = logging.getLogger('PeerDiscovery')
 
-    def initialize_trust(self):
-        for peer in self.seed_peers:
-            self.peer_trust[peer] = 1.0
-            self.peer_connections[peer] = []
+    async def start(self):
+        """Start peer discovery service"""
+        # Register our own service
+        self.info = ServiceInfo(
+            self.SERVICE_TYPE,
+            f'{self.node_id}.{self.SERVICE_TYPE}',
+            addresses=[self._get_ip_address()],
+            port=self.port,
+            properties={'node_id': self.node_id}
+        )
+        
+        try:
+            self.zeroconf.register_service(self.info)
+            self.browser = ServiceBrowser(self.zeroconf, self.SERVICE_TYPE, handlers=[self._on_peer_discovered])
+            self.logger.info(f'Started peer discovery on port {self.port}')
+        except Exception as e:
+            self.logger.error(f'Failed to start peer discovery: {e}')
+            raise
 
-    def discover_peers(self) -> List[str]:
-        discovered_peers = self.seed_peers[:]
-        for peer in self.seed_peers:
-            discovered_peers.extend(self.get_trusted_peers(peer))
-        return list(set(discovered_peers))
+    def stop(self):
+        """Stop peer discovery service"""
+        if self.browser:
+            self.browser.cancel()
+        if self.info:
+            self.zeroconf.unregister_service(self.info)
+        self.zeroconf.close()
+        self.logger.info('Stopped peer discovery')
 
-    def get_trusted_peers(self, peer: str) -> List[str]:
-        if peer not in self.peer_connections:
-            return []
-        trusted_peers = []
-        for connected_peer in self.peer_connections[peer]:
-            if self.peer_trust[connected_peer] >= 0.5:
-                trusted_peers.append(connected_peer)
-        return trusted_peers
+    def _on_peer_discovered(self, zeroconf: Zeroconf, service_type: str, name: str, state_change: str):
+        """Callback for when peers are discovered/removed"""
+        if state_change == 'Added':
+            info = zeroconf.get_service_info(service_type, name)
+            if info:
+                peer_id = info.properties.get(b'node_id', b'').decode('utf-8')
+                if peer_id and peer_id != self.node_id:
+                    address = self._get_address_from_info(info)
+                    self.peers[peer_id] = (address, info.port)
+                    self.logger.info(f'Discovered peer {peer_id} at {address}:{info.port}')
 
-    def add_peer(self, new_peer: str, trusted_by: str) -> bool:
-        if new_peer in self.peer_trust:
-            return False
-        self.peer_trust[new_peer] = self.peer_trust[trusted_by] * 0.8
-        self.peer_connections[trusted_by].append(new_peer)
-        self.peer_connections[new_peer] = []
-        return True
+        elif state_change == 'Removed':
+            # Remove peer when they go offline
+            peer_id = name.replace(f'.{self.SERVICE_TYPE}', '')
+            if peer_id in self.peers:
+                del self.peers[peer_id]
+                self.logger.info(f'Peer {peer_id} went offline')
 
-    def remove_peer(self, peer: str):
-        if peer not in self.peer_trust:
-            return
-        for connected_peer in self.peer_connections[peer]:
-            self.peer_connections[connected_peer].remove(peer)
-        del self.peer_trust[peer]
-        del self.peer_connections[peer]
+    def get_active_peers(self) -> Dict[str, tuple]:
+        """Get dictionary of active peers with their connection info"""
+        return self.peers.copy()
 
-    def update_trust(self, peer: str, trust_score: float):
-        if peer not in self.peer_trust:
-            return
-        self.peer_trust[peer] = trust_score
+    def _get_ip_address(self) -> bytes:
+        """Get local IP address in bytes format"""
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(('8.8.8.8', 80))
+            ip = s.getsockname()[0]
+        except Exception:
+            ip = '127.0.0.1'
+        finally:
+            s.close()
+        return socket.inet_aton(ip)
 
-    def serialize(self) -> str:
-        return json.dumps({
-            'seed_peers': self.seed_peers,
-            'trust_model': self.trust_model,
-            'peer_trust': self.peer_trust,
-            'peer_connections': self.peer_connections
-        })
+    def _get_address_from_info(self, info: ServiceInfo) -> str:
+        """Extract IP address from ServiceInfo"""
+        import socket
+        return socket.inet_ntoa(info.addresses[0]) if info.addresses else ''
 
-    def deserialize(self, data: str):
-        state = json.loads(data)
-        self.seed_peers = state['seed_peers']
-        self.trust_model = state['trust_model']
-        self.peer_trust = state['peer_trust']
-        self.peer_connections = state['peer_connections']
+    async def wait_for_peers(self, min_peers: int = 1, timeout: int = 30) -> bool:
+        """Wait until minimum number of peers are discovered"""
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            if len(self.peers) >= min_peers:
+                return True
+            await asyncio.sleep(1)
+        return False
