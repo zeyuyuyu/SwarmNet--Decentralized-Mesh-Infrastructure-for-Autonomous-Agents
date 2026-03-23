@@ -1,94 +1,112 @@
-import asyncio
-from zeroconf import ServiceInfo, Zeroconf, ServiceBrowser
-from typing import Dict, Set, Optional
+import socket
+import threading
 import time
+import json
+from typing import Dict, Set
 import logging
 
 class PeerDiscovery:
-    SERVICE_TYPE = '_swarmnet._tcp.local.'
-    
-    def __init__(self, node_id: str, port: int):
-        self.node_id = node_id
+    def __init__(self, port: int = 5000, broadcast_interval: float = 5.0):
         self.port = port
-        self.peers: Dict[str, tuple] = {}
-        self.zeroconf = Zeroconf()
-        self.browser = None
-        self.info = None
+        self.broadcast_interval = broadcast_interval
+        self.peers: Dict[str, float] = {}  # IP -> last_seen timestamp
+        self.node_id = self._generate_node_id()
+        self.running = False
+        self.peer_timeout = 15.0  # Seconds before peer is considered offline
+        
+        # Setup UDP socket for broadcast
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(('', self.port))
+        
+        logging.basicConfig(level=logging.INFO)
         self.logger = logging.getLogger('PeerDiscovery')
 
-    async def start(self):
+    def _generate_node_id(self) -> str:
+        """Generate unique node identifier"""
+        return f'{socket.gethostname()}-{id(self)}'
+
+    def start(self):
         """Start peer discovery service"""
-        # Register our own service
-        self.info = ServiceInfo(
-            self.SERVICE_TYPE,
-            f'{self.node_id}.{self.SERVICE_TYPE}',
-            addresses=[self._get_ip_address()],
-            port=self.port,
-            properties={'node_id': self.node_id}
-        )
+        self.running = True
+        self.broadcast_thread = threading.Thread(target=self._broadcast_loop)
+        self.listener_thread = threading.Thread(target=self._listen_loop)
+        self.cleanup_thread = threading.Thread(target=self._cleanup_loop)
         
-        try:
-            self.zeroconf.register_service(self.info)
-            self.browser = ServiceBrowser(self.zeroconf, self.SERVICE_TYPE, handlers=[self._on_peer_discovered])
-            self.logger.info(f'Started peer discovery on port {self.port}')
-        except Exception as e:
-            self.logger.error(f'Failed to start peer discovery: {e}')
-            raise
+        self.broadcast_thread.start()
+        self.listener_thread.start() 
+        self.cleanup_thread.start()
+        
+        self.logger.info(f'Peer discovery started on port {self.port}')
 
     def stop(self):
         """Stop peer discovery service"""
-        if self.browser:
-            self.browser.cancel()
-        if self.info:
-            self.zeroconf.unregister_service(self.info)
-        self.zeroconf.close()
-        self.logger.info('Stopped peer discovery')
+        self.running = False
+        self.broadcast_thread.join()
+        self.listener_thread.join()
+        self.cleanup_thread.join()
+        self.sock.close()
+        self.logger.info('Peer discovery stopped')
 
-    def _on_peer_discovered(self, zeroconf: Zeroconf, service_type: str, name: str, state_change: str):
-        """Callback for when peers are discovered/removed"""
-        if state_change == 'Added':
-            info = zeroconf.get_service_info(service_type, name)
-            if info:
-                peer_id = info.properties.get(b'node_id', b'').decode('utf-8')
-                if peer_id and peer_id != self.node_id:
-                    address = self._get_address_from_info(info)
-                    self.peers[peer_id] = (address, info.port)
-                    self.logger.info(f'Discovered peer {peer_id} at {address}:{info.port}')
+    def _broadcast_loop(self):
+        """Periodically broadcast presence to network"""
+        while self.running:
+            try:
+                message = {
+                    'type': 'heartbeat',
+                    'node_id': self.node_id,
+                    'timestamp': time.time()
+                }
+                self.sock.sendto(
+                    json.dumps(message).encode(),
+                    ('<broadcast>', self.port)
+                )
+                time.sleep(self.broadcast_interval)
+            except Exception as e:
+                self.logger.error(f'Broadcast error: {str(e)}')
 
-        elif state_change == 'Removed':
-            # Remove peer when they go offline
-            peer_id = name.replace(f'.{self.SERVICE_TYPE}', '')
-            if peer_id in self.peers:
-                del self.peers[peer_id]
-                self.logger.info(f'Peer {peer_id} went offline')
+    def _listen_loop(self):
+        """Listen for peer broadcasts"""
+        while self.running:
+            try:
+                data, addr = self.sock.recvfrom(1024)
+                message = json.loads(data.decode())
+                
+                if message['type'] == 'heartbeat':
+                    peer_ip = addr[0]
+                    self.peers[peer_ip] = message['timestamp']
+                    self.logger.debug(f'Heartbeat from peer {peer_ip}')
+            except Exception as e:
+                self.logger.error(f'Listener error: {str(e)}')
 
-    def get_active_peers(self) -> Dict[str, tuple]:
-        """Get dictionary of active peers with their connection info"""
-        return self.peers.copy()
+    def _cleanup_loop(self):
+        """Remove stale peers"""
+        while self.running:
+            try:
+                current_time = time.time()
+                stale_peers = [
+                    ip for ip, last_seen in self.peers.items()
+                    if current_time - last_seen > self.peer_timeout
+                ]
+                
+                for ip in stale_peers:
+                    del self.peers[ip]
+                    self.logger.info(f'Peer {ip} timed out')
+                    
+                time.sleep(self.peer_timeout / 2)
+            except Exception as e:
+                self.logger.error(f'Cleanup error: {str(e)}')
 
-    def _get_ip_address(self) -> bytes:
-        """Get local IP address in bytes format"""
-        import socket
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            s.connect(('8.8.8.8', 80))
-            ip = s.getsockname()[0]
-        except Exception:
-            ip = '127.0.0.1'
-        finally:
-            s.close()
-        return socket.inet_aton(ip)
+    def get_active_peers(self) -> Set[str]:
+        """Return set of currently active peer IPs"""
+        return set(self.peers.keys())
 
-    def _get_address_from_info(self, info: ServiceInfo) -> str:
-        """Extract IP address from ServiceInfo"""
-        import socket
-        return socket.inet_ntoa(info.addresses[0]) if info.addresses else ''
-
-    async def wait_for_peers(self, min_peers: int = 1, timeout: int = 30) -> bool:
-        """Wait until minimum number of peers are discovered"""
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            if len(self.peers) >= min_peers:
-                return True
-            await asyncio.sleep(1)
-        return False
+    def get_mesh_status(self) -> Dict:
+        """Return current mesh network status"""
+        return {
+            'node_id': self.node_id,
+            'active_peers': len(self.peers),
+            'peer_ips': list(self.peers.keys()),
+            'uptime': time.time() - list(self.peers.values())[0] if self.peers else 0
+        }
