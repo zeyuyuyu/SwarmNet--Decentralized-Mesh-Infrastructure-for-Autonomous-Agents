@@ -1,123 +1,102 @@
 import asyncio
+from typing import Dict, Set
+import time
 import json
 import logging
-from typing import Dict, Set, Optional
-from dataclasses import dataclass
-from datetime import datetime, timedelta
-
-@dataclass
-class PeerInfo:
-    id: str
-    address: str
-    last_seen: datetime
-    capabilities: Set[str]
 
 class PeerDiscovery:
-    def __init__(self, node_id: str, port: int = 8765):
+    def __init__(self, node_id: str, port: int):
         self.node_id = node_id
         self.port = port
-        self.peers: Dict[str, PeerInfo] = {}
-        self.heartbeat_interval = 30  # seconds
-        self.peer_timeout = 90  # seconds
+        self.peers: Dict[str, dict] = {}
+        self.active_peers: Set[str] = set()
+        self.last_heartbeat: Dict[str, float] = {}
         self.logger = logging.getLogger('PeerDiscovery')
 
     async def start(self):
-        self.logger.info(f'Starting peer discovery service on port {self.port}')
-        server = await asyncio.start_server(
-            self.handle_connection, '0.0.0.0', self.port
+        """Start peer discovery service"""
+        self.logger.info(f'Starting peer discovery service for node {self.node_id}')
+        await asyncio.gather(
+            self.heartbeat_loop(),
+            self.cleanup_loop()
         )
-        asyncio.create_task(self.heartbeat_loop())
-        asyncio.create_task(self.cleanup_loop())
-        await server.serve_forever()
-
-    async def handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        try:
-            data = await reader.read(1024)
-            message = json.loads(data.decode())
-            
-            if message['type'] == 'heartbeat':
-                peer_id = message['node_id']
-                peer_addr = writer.get_extra_info('peername')[0]
-                
-                self.peers[peer_id] = PeerInfo(
-                    id=peer_id,
-                    address=peer_addr,
-                    last_seen=datetime.now(),
-                    capabilities=set(message.get('capabilities', []))
-                )
-                
-                # Send response with our peer list
-                response = {
-                    'type': 'peers',
-                    'peers': [
-                        {'id': p.id, 'address': p.address, 'capabilities': list(p.capabilities)}
-                        for p in self.peers.values()
-                    ]
-                }
-                writer.write(json.dumps(response).encode())
-                await writer.drain()
-                
-        except Exception as e:
-            self.logger.error(f'Error handling connection: {e}')
-        finally:
-            writer.close()
-            await writer.wait_closed()
 
     async def heartbeat_loop(self):
+        """Periodically broadcast heartbeat to all known peers"""
         while True:
             try:
-                for peer_id, peer in list(self.peers.items()):
+                heartbeat = {
+                    'node_id': self.node_id,
+                    'timestamp': time.time(),
+                    'port': self.port,
+                    'peers': list(self.active_peers)
+                }
+                for peer_id, peer_info in self.peers.items():
                     try:
-                        reader, writer = await asyncio.open_connection(peer.address, self.port)
-                        message = {
-                            'type': 'heartbeat',
-                            'node_id': self.node_id,
-                            'capabilities': ['mesh', 'crawler']
-                        }
-                        writer.write(json.dumps(message).encode())
-                        await writer.drain()
-                        
-                        # Update peer list from response
-                        data = await reader.read(1024)
-                        response = json.loads(data.decode())
-                        if response['type'] == 'peers':
-                            for p in response['peers']:
-                                if p['id'] not in self.peers and p['id'] != self.node_id:
-                                    self.peers[p['id']] = PeerInfo(
-                                        id=p['id'],
-                                        address=p['address'], 
-                                        last_seen=datetime.now(),
-                                        capabilities=set(p['capabilities'])
-                                    )
-                                    
-                        writer.close()
-                        await writer.wait_closed()
-                        
+                        await self.send_heartbeat(peer_info['address'], peer_info['port'], heartbeat)
                     except Exception as e:
-                        self.logger.warning(f'Failed to heartbeat peer {peer_id}: {e}')
-                        
+                        self.logger.warning(f'Failed to send heartbeat to {peer_id}: {e}')
+                await asyncio.sleep(5)  # Heartbeat interval
             except Exception as e:
                 self.logger.error(f'Error in heartbeat loop: {e}')
-                
-            await asyncio.sleep(self.heartbeat_interval)
+                await asyncio.sleep(1)
 
     async def cleanup_loop(self):
+        """Remove stale peers that haven't sent heartbeat recently"""
         while True:
             try:
-                now = datetime.now()
-                expired = [
-                    peer_id for peer_id, peer in self.peers.items()
-                    if now - peer.last_seen > timedelta(seconds=self.peer_timeout)
+                current_time = time.time()
+                stale_peers = [
+                    peer_id for peer_id, last_beat in self.last_heartbeat.items()
+                    if current_time - last_beat > 15  # Peer timeout threshold
                 ]
-                for peer_id in expired:
-                    self.logger.info(f'Removing expired peer {peer_id}')
-                    del self.peers[peer_id]
+                for peer_id in stale_peers:
+                    self.remove_peer(peer_id)
+                await asyncio.sleep(5)
             except Exception as e:
                 self.logger.error(f'Error in cleanup loop: {e}')
-            await asyncio.sleep(self.heartbeat_interval)
+                await asyncio.sleep(1)
 
-    def get_peers_by_capability(self, capability: str) -> Set[PeerInfo]:
-        return {p for p in self.peers.values() if capability in p.capabilities}
+    async def send_heartbeat(self, address: str, port: int, data: dict):
+        """Send heartbeat to a specific peer"""
+        try:
+            reader, writer = await asyncio.open_connection(address, port)
+            writer.write(json.dumps(data).encode())
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+        except Exception as e:
+            raise Exception(f'Failed to send heartbeat: {e}')
 
-    def get_all_peers(self) -> Set[PeerInfo]:
-        return set(self.peers.values())
+    def handle_heartbeat(self, peer_heartbeat: dict):
+        """Process received heartbeat from peer"""
+        peer_id = peer_heartbeat['node_id']
+        self.last_heartbeat[peer_id] = peer_heartbeat['timestamp']
+        
+        if peer_id not in self.peers:
+            self.peers[peer_id] = {
+                'address': peer_heartbeat.get('address'),
+                'port': peer_heartbeat.get('port')
+            }
+            self.active_peers.add(peer_id)
+            self.logger.info(f'New peer discovered: {peer_id}')
+
+        # Merge peer lists
+        new_peers = set(peer_heartbeat['peers']) - self.active_peers
+        self.active_peers.update(new_peers)
+
+    def remove_peer(self, peer_id: str):
+        """Remove a peer from tracking"""
+        if peer_id in self.peers:
+            del self.peers[peer_id]
+            self.active_peers.remove(peer_id)
+            del self.last_heartbeat[peer_id]
+            self.logger.info(f'Removed stale peer: {peer_id}')
+
+    def get_active_peers(self) -> Set[str]:
+        """Get set of currently active peer IDs"""
+        return self.active_peers.copy()
+
+    def get_peer_info(self, peer_id: str) -> dict:
+        """Get connection info for specific peer"""
+        return self.peers.get(peer_id, {})
